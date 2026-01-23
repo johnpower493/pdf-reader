@@ -1,0 +1,141 @@
+:root {
+  --bg0: #0b1020;
+  --bg1: #0f1730;
+  --card: rgba(255, 255, 255, 0.06);
+  --card2: rgba(255, 255, 255, 0.09);
+  --text: rgba(255, 255, 255, 0.92);
+  --muted: rgba(255, 255, 255, 0.65);
+  --accent: #7c5cff;
+  --accent2: #33d1ff;
+}
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+  background: radial-gradient(1200px 800px at 10% 10%, rgba(124, 92, 255, 0.35), transparent 50%),
+    radial-gradient(1200px 800px at 90% 20%, rgba(51, 209, 255, 0.28), transparent 55%),
+    linear-gradient(180deg, var(--bg0), var(--bg1));
+  color: var(--text);
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 28px 20px 60px;
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.title {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.subtitle {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+@media (min-width: 950px) {
+  .grid {
+    grid-template-columns: 360px 1fr;
+  }
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  backdrop-filter: blur(10px);
+  padding: 16px;
+}
+
+.card h2 {
+  margin: 0 0 10px 0;
+  font-size: 14px;
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.button {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: linear-gradient(180deg, rgba(124, 92, 255, 0.25), rgba(124, 92, 255, 0.12));
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 8px;
+  align-items: center;
+  margin: 10px 0;
+}
+
+.kv label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.kv input {
+  width: 100%;
+}
+
+.reader {
+  line-height: 1.9;
+  font-size: 18px;
+  padding: 16px;
+  background: var(--card2);
+  border-radius: 14px;
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.word {
+  padding: 2px 2px;
+  border-radius: 6px;
+}
+
+.word.active {
+  background: rgba(51, 209, 255, 0.22);
+  outline: 1px solid rgba(51, 209, 255, 0.35);
+}
+
+.small {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.error {
+  color: #ffb4b4;
+  font-size: 13px;
+  white-space: pre-wrap;
+}
