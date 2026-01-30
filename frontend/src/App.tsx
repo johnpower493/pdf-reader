@@ -3,6 +3,7 @@ import "./App.css";
 import { API_BASE, base64ToBlob, clearCache, listVoices, tts, uploadBook, type WordTiming } from "./api";
 import { activeWordIndex } from "./highlight";
 import { clearSession, loadSession, saveSession } from "./persist";
+import { detectSections, type Section } from "./sections";
 
 function fnv1a64(input: string): string {
   // Fast, non-cryptographic hash to detect mismatched resume data.
@@ -27,6 +28,8 @@ function formatMs(ms: number): string {
 
 type Chunk = {
   index: number;
+  sectionIndex: number;
+  sectionTitle: string;
   text: string;
 };
 
@@ -87,6 +90,10 @@ export default function App() {
   const [hasAudio, setHasAudio] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Book structure
+  const [sections, setSections] = useState<Section[]>([]);
+  const [currentSectionIndex, setCurrentSectionIndex] = useState<number>(0);
 
   // Playback state
   const [chunks, setChunks] = useState<Chunk[]>([]);
@@ -166,6 +173,8 @@ export default function App() {
 
   const canPrevChunk = currentChunkIndex > 0;
   const canNextChunk = currentChunkIndex + 1 < chunks.length;
+  const canPrevSection = currentSectionIndex > 0;
+  const canNextSection = currentSectionIndex + 1 < sections.length;
 
 
   // Keep globalMs in sync with audio time + current chunk offset.
@@ -190,9 +199,10 @@ export default function App() {
       voice,
       speed,
       chunkIndex: currentChunkIndex,
+      sectionIndex: currentSectionIndex,
       localMs: Math.max(0, globalMs - currentOffsetMs),
     });
-  }, [filename, text, voice, speed, currentChunkIndex, globalMs, currentOffsetMs]);
+  }, [filename, text, voice, speed, currentChunkIndex, currentSectionIndex, globalMs, currentOffsetMs]);
 
   // auto-scroll active word into view
   useEffect(() => {
@@ -272,7 +282,23 @@ export default function App() {
       const res = await uploadBook(file);
       setFilename(res.filename);
       setText(res.text);
-      setChunks(chunkText(res.text, 1200).map((t, i) => ({ index: i, text: t })));
+
+      const secs = detectSections(res.text);
+      setSections(secs);
+      setCurrentSectionIndex(0);
+
+      // Flatten section chunks into a single chunk list for TTS caching and playback.
+      const flat: Chunk[] = [];
+      for (let si = 0; si < secs.length; si++) {
+        const s = secs[si]!;
+        const title = (s.title || `Section ${si + 1}`).trim();
+        const parts = chunkText(res.text.slice(s.start, s.end), 1200);
+        for (const part of parts) {
+          flat.push({ index: flat.length, sectionIndex: si, sectionTitle: title, text: part });
+        }
+      }
+      setChunks(flat);
+
       setResumeAvailable(false);
       clearSession();
     } catch (e: unknown) {
@@ -418,13 +444,31 @@ export default function App() {
     setText(s.text);
     setVoice(s.voice);
     setSpeed(s.speed);
-    const ch = chunkText(s.text, 1200).map((t, i) => ({ index: i, text: t }));
-    setChunks(ch);
+
+    const secs = detectSections(s.text);
+    setSections(secs);
+
+    const flat: Chunk[] = [];
+    for (let si = 0; si < secs.length; si++) {
+      const sec = secs[si]!;
+      const title = (sec.title || `Section ${si + 1}`).trim();
+      const parts = chunkText(s.text.slice(sec.start, sec.end), 1200);
+      for (const part of parts) {
+        flat.push({ index: flat.length, sectionIndex: si, sectionTitle: title, text: part });
+      }
+    }
+    setChunks(flat);
+
+    // Best-effort: infer section index from chunk index.
+    const resumeChunk = s.chunkIndex ?? 0;
+    const resumeSection = flat[resumeChunk]?.sectionIndex ?? 0;
+    setCurrentSectionIndex(resumeSection);
+
     setResumeAvailable(false);
 
     // Give React a tick to apply chunks state, then start
     setTimeout(() => {
-      startFrom(s.chunkIndex ?? 0, s.localMs ?? 0);
+      startFrom(resumeChunk, s.localMs ?? 0);
     }, 0);
   }
 
@@ -438,6 +482,7 @@ export default function App() {
       if (nextIdx >= chunks.length) return;
 
       setCurrentChunkIndex(nextIdx);
+      setCurrentSectionIndex(chunks[nextIdx]?.sectionIndex ?? currentSectionIndex);
 
       const epoch = genEpochRef.current;
       setLoading(true);
@@ -455,7 +500,20 @@ export default function App() {
     };
     a.addEventListener("ended", onEnded);
     return () => a.removeEventListener("ended", onEnded);
-  }, [currentChunkIndex, chunks.length, ensureChunkReadyAndMaybePlay, prefetch]);
+  }, [currentChunkIndex, chunks, currentSectionIndex, ensureChunkReadyAndMaybePlay, prefetch]);
+
+  function firstChunkIndexForSection(sectionIdx: number): number {
+    const idx = chunks.findIndex((c) => c.sectionIndex === sectionIdx);
+    return idx >= 0 ? idx : 0;
+  }
+
+  async function jumpToSection(sectionIdx: number) {
+    if (!sections.length) return;
+    const clamped = Math.max(0, Math.min(sections.length - 1, sectionIdx));
+    setCurrentSectionIndex(clamped);
+    const chunkIdx = firstChunkIndexForSection(clamped);
+    await jumpToChunk(chunkIdx, 0);
+  }
 
   async function jumpToChunk(chunkIdx: number, seekLocalMs?: number) {
     if (!chunks.length) return;
@@ -476,6 +534,7 @@ export default function App() {
     }
 
     setCurrentChunkIndex(chunkIdx);
+    setCurrentSectionIndex(chunks[chunkIdx]?.sectionIndex ?? currentSectionIndex);
     setLoading(true);
     try {
       await ensureChunkReadyAndMaybePlay(chunkIdx, epoch, seekLocalMs);
@@ -561,6 +620,25 @@ export default function App() {
             </div>
           )}
 
+          <h2 style={{ marginTop: 18 }}>Structure</h2>
+          <div className="kv">
+            <label>Section</label>
+            <select
+              value={currentSectionIndex}
+              onChange={(e) => {
+                const idx = parseInt(e.target.value, 10);
+                void jumpToSection(Number.isFinite(idx) ? idx : 0);
+              }}
+              disabled={!sections.length || loading}
+            >
+              {sections.map((s, idx) => (
+                <option key={idx} value={idx}>
+                  {idx + 1}. {s.title}
+                </option>
+              ))}
+            </select>
+          </div>
+
           <h2 style={{ marginTop: 18 }}>Speech</h2>
           <div className="kv">
             <label>Voice</label>
@@ -602,6 +680,22 @@ export default function App() {
             </button>
             <button
               className="button"
+              disabled={loading || !sections.length || !canPrevSection}
+              onClick={() => void jumpToSection(currentSectionIndex - 1)}
+              title="Previous section"
+            >
+              Prev section
+            </button>
+            <button
+              className="button"
+              disabled={loading || !sections.length || !canNextSection}
+              onClick={() => void jumpToSection(currentSectionIndex + 1)}
+              title="Next section"
+            >
+              Next section
+            </button>
+            <button
+              className="button"
               disabled={loading || !chunks.length || !canPrevChunk}
               onClick={() => void jumpToChunk(currentChunkIndex - 1)}
               title="Previous chunk"
@@ -636,7 +730,7 @@ export default function App() {
           </div>
 
           <div className="small" style={{ marginTop: 10 }}>
-            Chunks: {chunks.length} | Loaded: {loadedChunks.size} | Current chunk: {currentChunkIndex + 1}/{Math.max(1, chunks.length)}
+            Sections: {sections.length} | Current: {currentSectionIndex + 1}/{Math.max(1, sections.length)} | Chunks: {chunks.length} | Loaded: {loadedChunks.size} | Current chunk: {currentChunkIndex + 1}/{Math.max(1, chunks.length)}
           </div>
 
           <div className="small" style={{ marginTop: 10 }}>

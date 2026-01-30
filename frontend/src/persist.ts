@@ -7,6 +7,7 @@ export type PersistedSession = {
   speed: number;
   // resume info
   chunkIndex: number;
+  sectionIndex?: number;
   localMs: number;
 };
 
