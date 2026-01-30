@@ -1,8 +1,29 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { API_BASE, base64ToBlob, clearCache, listVoices, tts, uploadBook, type WordTiming } from "./api";
 import { activeWordIndex } from "./highlight";
 import { clearSession, loadSession, saveSession } from "./persist";
+
+function fnv1a64(input: string): string {
+  // Fast, non-cryptographic hash to detect mismatched resume data.
+  // Returns unsigned 64-bit as hex string.
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = (hash * prime) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+function formatMs(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
 
 type Chunk = {
   index: number;
@@ -61,6 +82,9 @@ export default function App() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
+  const [status, setStatus] = useState<string>("");
+
+  const [hasAudio, setHasAudio] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -68,38 +92,84 @@ export default function App() {
   const [chunks, setChunks] = useState<Chunk[]>([]);
   const [loadedChunks, setLoadedChunks] = useState<Map<number, LoadedChunk>>(() => new Map());
   const [currentChunkIndex, setCurrentChunkIndex] = useState<number>(0);
+  // The start of the current "global" timeline. If we start playback from a later
+  // chunk (or jump ahead before earlier chunks are generated), we set this so word
+  // timings can still render.
+  const [baseChunkIndex, setBaseChunkIndex] = useState<number>(0);
   const [globalMs, setGlobalMs] = useState<number>(0);
 
-  // Merged word timings across loaded chunks (in strict chunk order)
-  const [globalTimings, setGlobalTimings] = useState<GlobalTiming[]>([]);
-  const nextMergeIndexRef = useRef<number>(0);
-  const mergeOffsetMsRef = useRef<number>(0);
+  // Merged word timings across loaded chunks (in strict chunk order).
+  // Derived from `loadedChunks` to avoid race conditions and ensure the reader
+  // always shows words as soon as chunks are available.
+  const globalTimings = useMemo((): GlobalTiming[] => {
+    const out: GlobalTiming[] = [];
+    let offsetMs = 0;
+
+    for (let chunkIdx = baseChunkIndex; chunkIdx < chunks.length; chunkIdx++) {
+      const c = loadedChunks.get(chunkIdx);
+      if (!c) break; // only show contiguous loaded region
+
+      for (const t of c.timings) {
+        out.push({
+          word: t.word,
+          start_ms: t.start_ms + offsetMs,
+          end_ms: t.end_ms + offsetMs,
+          chunkIndex: chunkIdx,
+          localStartMs: t.start_ms,
+          localEndMs: t.end_ms,
+        });
+      }
+
+      offsetMs += c.durationMs;
+    }
+
+    return out;
+  }, [baseChunkIndex, chunks.length, loadedChunks]);
 
   // For canceling in-flight synthesis when restarting/jumping
   const genEpochRef = useRef<number>(0);
 
   const activeIdx = useMemo(() => activeWordIndex(globalTimings, globalMs), [globalTimings, globalMs]);
 
-  // Precomputed prefix duration for quick offset calculations
+  // Precomputed prefix duration for quick offset calculations (relative to baseChunkIndex)
   const prefixDurationsMs = useMemo(() => {
     const maxIdx = chunks.length;
-    const prefix: number[] = new Array(maxIdx + 1).fill(0);
-    for (let i = 0; i < maxIdx; i++) {
+    const prefix: number[] = [0];
+    let total = 0;
+    for (let i = baseChunkIndex; i < maxIdx; i++) {
       const c = loadedChunks.get(i);
-      prefix[i + 1] = prefix[i] + (c?.durationMs ?? 0);
+      total += c?.durationMs ?? 0;
+      prefix.push(total);
     }
     return prefix;
-  }, [chunks.length, loadedChunks]);
+  }, [baseChunkIndex, chunks.length, loadedChunks]);
 
-  const currentOffsetMs = useMemo(() => prefixDurationsMs[currentChunkIndex] ?? 0, [prefixDurationsMs, currentChunkIndex]);
+  const currentOffsetMs = useMemo(() => {
+    const rel = Math.max(0, currentChunkIndex - baseChunkIndex);
+    return prefixDurationsMs[rel] ?? 0;
+  }, [prefixDurationsMs, currentChunkIndex, baseChunkIndex]);
 
-  // When loadedChunks updates (prefetch can complete out-of-order), merge timings in strict chunk order.
-  useEffect(() => {
-    tryMergeInOrder();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadedChunks]);
+  // Duration we can confidently seek within: contiguous durations from chunk 0..N
+  const playablePrefixMs = useMemo(() => {
+    const prefix: number[] = [0];
+    let total = 0;
+    for (let i = baseChunkIndex; i < chunks.length; i++) {
+      const c = loadedChunks.get(i);
+      if (!c) break;
+      total += c.durationMs;
+      prefix.push(total);
+    }
+    return prefix;
+  }, [baseChunkIndex, chunks.length, loadedChunks]);
 
-  // Keep globalMs in sync with audio time + current chunk offset
+  const playableTotalMs = playablePrefixMs[playablePrefixMs.length - 1] ?? 0;
+
+  const canPrevChunk = currentChunkIndex > 0;
+  const canNextChunk = currentChunkIndex + 1 < chunks.length;
+
+
+  // Keep globalMs in sync with audio time + current chunk offset.
+  // Note: globalMs is relative to baseChunkIndex (not necessarily chunk 0).
   useEffect(() => {
     const a = audioRef.current;
     if (!a) return;
@@ -116,6 +186,7 @@ export default function App() {
     saveSession({
       filename,
       text,
+      textHash: fnv1a64(text),
       voice,
       speed,
       chunkIndex: currentChunkIndex,
@@ -160,6 +231,18 @@ export default function App() {
       a.currentTime = 0;
       a.src = "";
     }
+    setHasAudio(false);
+  }
+
+  function onStop() {
+    const a = audioRef.current;
+    if (a) {
+      a.pause();
+      a.currentTime = 0;
+      // Do NOT clear src; user expects Play to resume from start of current chunk.
+    }
+    setHasAudio(!!audioRef.current?.src);
+    setStatus("Stopped");
   }
 
   function resetPlaybackState() {
@@ -169,17 +252,16 @@ export default function App() {
       if (c.audioUrl.startsWith("blob:")) URL.revokeObjectURL(c.audioUrl);
     }
     setLoadedChunks(new Map());
-    setGlobalTimings([]);
     setGlobalMs(0);
     setCurrentChunkIndex(0);
+    setBaseChunkIndex(0);
 
-    nextMergeIndexRef.current = 0;
-    mergeOffsetMsRef.current = 0;
   }
 
   async function onUpload() {
     if (!file) return;
     setError("");
+    setStatus("");
     setLoading(true);
 
     // new book: reset
@@ -193,14 +275,16 @@ export default function App() {
       setChunks(chunkText(res.text, 1200).map((t, i) => ({ index: i, text: t })));
       setResumeAvailable(false);
       clearSession();
-    } catch (e: any) {
-      setError(String(e?.message ?? e));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
     } finally {
       setLoading(false);
     }
   }
 
-  async function loadChunk(idx: number, epoch: number): Promise<LoadedChunk> {
+  const loadChunk = useCallback(
+    async (idx: number, epoch: number): Promise<LoadedChunk> => {
     const existing = loadedChunks.get(idx);
     if (existing) return existing;
     const chunk = chunks[idx];
@@ -228,52 +312,12 @@ export default function App() {
     };
 
     return loaded;
-  }
+    },
+    [chunks, filename, loadedChunks, speed, voice],
+  );
 
-  function tryMergeInOrder() {
-    // We merge timings strictly in chunk order to avoid out-of-order prefetch scrambling.
-    // We also compute offsets based on the merged duration so far.
-
-    setGlobalTimings((prev) => {
-      const alreadyMerged = new Set(prev.map((t) => t.chunkIndex));
-      let nextIndex = nextMergeIndexRef.current;
-      let offsetMs = mergeOffsetMsRef.current;
-
-      const additions: GlobalTiming[] = [];
-      while (true) {
-        const c = loadedChunks.get(nextIndex);
-        if (!c) break;
-        if (alreadyMerged.has(nextIndex)) {
-          // if this happens, advance safely
-          offsetMs += c.durationMs;
-          nextIndex += 1;
-          continue;
-        }
-
-        for (const t of c.timings) {
-          additions.push({
-            word: t.word,
-            start_ms: t.start_ms + offsetMs,
-            end_ms: t.end_ms + offsetMs,
-            chunkIndex: nextIndex,
-            localStartMs: t.start_ms,
-            localEndMs: t.end_ms,
-          });
-        }
-
-        offsetMs += c.durationMs;
-        nextIndex += 1;
-      }
-
-      nextMergeIndexRef.current = nextIndex;
-      mergeOffsetMsRef.current = offsetMs;
-
-      if (additions.length === 0) return prev;
-      return [...prev, ...additions];
-    });
-  }
-
-  async function ensureChunkReadyAndMaybePlay(idx: number, epoch: number, seekLocalMs?: number) {
+  const ensureChunkReadyAndMaybePlay = useCallback(
+    async (idx: number, epoch: number, seekLocalMs?: number) => {
     // load
     const loaded = await loadChunk(idx, epoch);
 
@@ -289,11 +333,15 @@ export default function App() {
       const a = audioRef.current;
       a.src = loaded.audioUrl;
       a.currentTime = seekLocalMs ? msToS(seekLocalMs) : 0;
+      setHasAudio(true);
       await a.play();
     }
-  }
+    },
+    [loadChunk],
+  );
 
-  async function prefetch(idx: number, epoch: number) {
+  const prefetch = useCallback(
+    async (idx: number, epoch: number) => {
     if (idx < 0 || idx >= chunks.length) return;
     if (loadedChunks.has(idx)) return;
     try {
@@ -304,15 +352,19 @@ export default function App() {
         next.set(idx, loaded);
         return next;
       });
-    } catch (e: any) {
-      if (String(e?.message ?? e) === "generation_cancelled") return;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg === "generation_cancelled") return;
       // ignore prefetch failures; main playback will surface errors
     }
-  }
+    },
+    [chunks.length, loadedChunks, loadChunk],
+  );
 
   async function startFrom(chunkIdx: number, seekLocalMs?: number) {
     if (!chunks.length) return;
     setError("");
+    setStatus("");
 
     const epoch = genEpochRef.current + 1;
     genEpochRef.current = epoch;
@@ -321,9 +373,10 @@ export default function App() {
     try {
       // reset playback but keep text/chunks
       resetPlaybackState();
+      setBaseChunkIndex(chunkIdx);
       setCurrentChunkIndex(chunkIdx);
 
-      // Load & play chunk 1 ASAP
+      // Load & play selected chunk
       await ensureChunkReadyAndMaybePlay(chunkIdx, epoch, seekLocalMs);
 
       // Prefetch next chunk immediately
@@ -331,8 +384,8 @@ export default function App() {
 
       // Also prefetch one more in background
       prefetch(chunkIdx + 2, epoch);
-    } catch (e: any) {
-      const msg = String(e?.message ?? e);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
       if (msg !== "generation_cancelled") setError(msg);
     } finally {
       setLoading(false);
@@ -347,6 +400,16 @@ export default function App() {
   async function onResume() {
     const s = loadSession();
     if (!s) return;
+
+    // Validate resume payload to avoid resuming into mismatched/corrupted data.
+    const computed = fnv1a64(s.text);
+    // If hash is present, enforce it. If absent (older session), accept and proceed.
+    if (s.textHash && s.textHash !== computed) {
+      setError("Resume data does not match saved content (text hash mismatch). Please upload again.");
+      clearSession();
+      setResumeAvailable(false);
+      return;
+    }
 
     genEpochRef.current++;
     resetPlaybackState();
@@ -369,6 +432,7 @@ export default function App() {
   useEffect(() => {
     const a = audioRef.current;
     if (!a) return;
+
     const onEnded = async () => {
       const nextIdx = currentChunkIndex + 1;
       if (nextIdx >= chunks.length) return;
@@ -382,8 +446,8 @@ export default function App() {
         await ensureChunkReadyAndMaybePlay(nextIdx, epoch);
         // prefetch further
         prefetch(nextIdx + 1, epoch);
-      } catch (e: any) {
-        const msg = String(e?.message ?? e);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
         if (msg !== "generation_cancelled") setError(msg);
       } finally {
         setLoading(false);
@@ -391,7 +455,39 @@ export default function App() {
     };
     a.addEventListener("ended", onEnded);
     return () => a.removeEventListener("ended", onEnded);
-  }, [currentChunkIndex, chunks.length, prefixDurationsMs]);
+  }, [currentChunkIndex, chunks.length, ensureChunkReadyAndMaybePlay, prefetch]);
+
+  async function jumpToChunk(chunkIdx: number, seekLocalMs?: number) {
+    if (!chunks.length) return;
+    if (chunkIdx < 0 || chunkIdx >= chunks.length) return;
+
+    setError("");
+    setStatus("");
+
+    const epoch = genEpochRef.current + 1;
+    genEpochRef.current = epoch;
+
+    // If we haven't generated earlier chunks, move the base so words/timings can render.
+    // Also allow user to jump back before the base.
+    if (!loadedChunks.has(0)) {
+      if (chunkIdx < baseChunkIndex || (baseChunkIndex === 0 && chunkIdx !== 0)) {
+        setBaseChunkIndex(chunkIdx);
+      }
+    }
+
+    setCurrentChunkIndex(chunkIdx);
+    setLoading(true);
+    try {
+      await ensureChunkReadyAndMaybePlay(chunkIdx, epoch, seekLocalMs);
+      prefetch(chunkIdx + 1, epoch);
+      prefetch(chunkIdx - 1, epoch);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg !== "generation_cancelled") setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   // Click-to-seek by word
   async function onWordClick(idx: number) {
@@ -407,8 +503,8 @@ export default function App() {
       return;
     }
 
-    // Jump to that chunk (start from it)
-    await startFrom(t.chunkIndex, t.localStartMs);
+    // Jump to that chunk without resetting already-generated chunks
+    await jumpToChunk(t.chunkIndex, t.localStartMs);
 
     // Opportunistic prefetch the following chunk
     prefetch(t.chunkIndex + 1, epoch);
@@ -423,7 +519,7 @@ export default function App() {
           <div className="title">Kokoro Visual Reader</div>
           <div className="subtitle">Full-book chunked playback, word highlighting, resume, and click-to-seek.</div>
         </div>
-        <div className="small">Backend: http://localhost:8000</div>
+        <div className="small">Backend: {API_BASE}</div>
       </div>
 
       <div className="grid">
@@ -496,21 +592,42 @@ export default function App() {
             </button>
             <button
               className="button"
-              disabled={!audioRef.current}
+              disabled={!hasAudio || loading}
               onClick={() => (audioRef.current?.paused ? audioRef.current?.play() : audioRef.current?.pause())}
             >
               Play/Pause
+            </button>
+            <button className="button" disabled={!hasAudio || loading} onClick={onStop}>
+              Stop
+            </button>
+            <button
+              className="button"
+              disabled={loading || !chunks.length || !canPrevChunk}
+              onClick={() => void jumpToChunk(currentChunkIndex - 1)}
+              title="Previous chunk"
+            >
+              Prev chunk
+            </button>
+            <button
+              className="button"
+              disabled={loading || !chunks.length || !canNextChunk}
+              onClick={() => void jumpToChunk(currentChunkIndex + 1)}
+              title="Next chunk"
+            >
+              Next chunk
             </button>
             <button
               className="button"
               disabled={loading}
               onClick={async () => {
                 setError("");
+                setStatus("");
                 try {
                   const res = await clearCache();
-                  setError(`Cleared cache files: ${res.deleted}`);
-                } catch (e: any) {
-                  setError(String(e?.message ?? e));
+                  setStatus(`Cleared cache files: ${res.deleted}`);
+                } catch (e: unknown) {
+                  const msg = e instanceof Error ? e.message : String(e);
+                  setError(msg);
                 }
               }}
             >
@@ -522,6 +639,49 @@ export default function App() {
             Chunks: {chunks.length} | Loaded: {loadedChunks.size} | Current chunk: {currentChunkIndex + 1}/{Math.max(1, chunks.length)}
           </div>
 
+          <div className="small" style={{ marginTop: 10 }}>
+            Time: {formatMs(globalMs)} / {playableTotalMs ? formatMs(playableTotalMs) : "—"}
+            {baseChunkIndex > 0 ? ` (from chunk ${baseChunkIndex + 1})` : ""}
+          </div>
+
+          <input
+            type="range"
+            min={0}
+            max={Math.max(0, playableTotalMs)}
+            step={50}
+            value={Math.min(globalMs, playableTotalMs || globalMs)}
+            disabled={!playableTotalMs || loading}
+            onChange={(e) => {
+              const targetMs = Number(e.target.value);
+              // Find chunk within playable contiguous prefix and seek.
+              let relChunk = 0;
+              for (let i = 0; i < playablePrefixMs.length - 1; i++) {
+                if (targetMs >= playablePrefixMs[i] && targetMs < playablePrefixMs[i + 1]) {
+                  relChunk = i;
+                  break;
+                }
+              }
+              const chunkIdx = baseChunkIndex + relChunk;
+              const localMs = targetMs - (playablePrefixMs[relChunk] ?? 0);
+
+              // If seeking within the currently playing loaded chunk, do a cheap seek.
+              if (chunkIdx === currentChunkIndex && loadedChunks.has(chunkIdx) && audioRef.current) {
+                audioRef.current.currentTime = msToS(localMs);
+                void audioRef.current.play();
+                return;
+              }
+
+              void jumpToChunk(chunkIdx, localMs);
+            }}
+            style={{ width: "100%", marginTop: 6 }}
+            title="Seek within generated audio"
+          />
+
+          {status && (
+            <div className="small" style={{ marginTop: 12 }}>
+              {status}
+            </div>
+          )}
           {error && (
             <div className="error" style={{ marginTop: 12 }}>
               {error}

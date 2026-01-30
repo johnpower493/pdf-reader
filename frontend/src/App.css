@@ -109,6 +109,10 @@ body {
   width: 100%;
 }
 
+input[type="range"] {
+  accent-color: var(--accent2);
+}
+
 .reader {
   line-height: 1.9;
   font-size: 18px;

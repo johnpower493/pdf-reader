@@ -23,7 +23,10 @@ export type VoicesResponse = {
   voices: string[];
 };
 
-export const API_BASE = "http://localhost:8000";
+// Configurable via Vite env var (recommended for deployments):
+//   VITE_API_BASE=http://localhost:8000
+// Falls back to localhost for local dev.
+export const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
 export async function uploadBook(file: File): Promise<UploadResponse> {
   const fd = new FormData();

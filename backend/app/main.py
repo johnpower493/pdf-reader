@@ -36,7 +36,11 @@ try:
 except Exception:
     pass
 
-app.mount("/output", StaticFiles(directory="output"), name="output")
+# Mount the output directory using an absolute path so it works regardless of
+# the process working directory (e.g. running uvicorn from repo root vs backend/).
+from .cache import output_dir
+
+app.mount("/output", StaticFiles(directory=str(output_dir())), name="output")
 
 # For local dev: allow Vite dev server
 app.add_middleware(

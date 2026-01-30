@@ -1,6 +1,8 @@
 export type PersistedSession = {
   filename: string;
   text: string;
+  // Added in v2 of the persisted format. Optional for backward compatibility.
+  textHash?: string;
   voice: string;
   speed: number;
   // resume info
