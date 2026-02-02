@@ -12,7 +12,17 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .models import TTSRequest, TTSResponse, UploadResponse, WordTiming
+from .models import (
+    BookConvertRequest,
+    BookJobStatus,
+    BookMeta,
+    BookCombined,
+    TTSRequest,
+    TTSResponse,
+    UploadResponse,
+    WordTiming,
+)
+
 from .text_extract import extract_text_from_pdf, extract_text_from_txt
 from .voices import list_kokoro_voice_ids
 from .cache import cache_key as tts_cache_key, exists as cache_exists, load_metadata, save_cache, timings_to_jsonable
@@ -21,9 +31,14 @@ from .book_output import (
     append_to_combined,
     chunk_json_path,
     chunk_wav_path,
+    combined_json_path,
+    combined_wav_path,
     ensure_book_dirs,
     sanitize_book_id,
 )
+from .book_jobs import book_job_manager
+from .book_api import require_book_id
+from .book_meta import book_meta_payload
 
 app = FastAPI(title="Kokoro Visual TTS")
 
@@ -243,7 +258,158 @@ async def upload(file: UploadFile = File(...)):
     if not text:
         raise HTTPException(status_code=400, detail="No extractable text found")
 
-    return UploadResponse(filename=filename, text=text)
+    # Derive a stable book_id from filename (without extension)
+    book_id = sanitize_book_id(re.sub(r"\.[^/.]+$", "", filename) or "book")
+    # Persist source text so the backend can do continuous conversion in background.
+    try:
+        book_job_manager.write_source_text(book_id, text)
+    except Exception:
+        # Non-fatal: user can still do per-chunk /api/tts
+        book_id = None
+
+    return UploadResponse(filename=filename, text=text, book_id=book_id)
+
+
+
+def _synthesize_and_store_book_chunk(*, book_id: str, chunk_index: int, text: str, voice: str, speed: float) -> TTSResponse:
+    """Synthesize a single chunk and store it under output/<book_id>/chunks.
+
+    Returns the same payload shape as /api/tts for book chunks.
+    """
+    book_id = sanitize_book_id(book_id)
+    ensure_book_dirs(book_id)
+
+    key = f"{book_id}:{chunk_index}:{voice}:{speed}"
+
+    # Cache hit
+    wav_p = chunk_wav_path(book_id, chunk_index)
+    json_p = chunk_json_path(book_id, chunk_index)
+    if wav_p.exists() and json_p.exists():
+        meta = json.loads(json_p.read_text(encoding="utf-8"))
+        timings = [WordTiming(**t) for t in meta.get("timings", [])]
+        rel = f"/output/{book_id}/chunks/{chunk_index:06d}.wav"
+        return TTSResponse(
+            sample_rate=int(meta.get("sample_rate", _KOKORO_SR)),
+            duration_ms=int(meta.get("duration_ms", 0)),
+            timings=timings,
+            audio_url=rel,
+            cache_key=key,
+        )
+
+    audio, sr, timings = _kokoro_synthesize(text, voice, speed)
+
+    duration_ms = int(round(len(audio) / sr * 1000.0))
+    if not timings:
+        timings = _estimate_word_timings(text, duration_ms)
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+    wav_bytes = buf.getvalue()
+
+    wav_p.write_bytes(wav_bytes)
+    json_p.write_text(
+        json.dumps(
+            {
+                "cache_key": key,
+                "sample_rate": sr,
+                "duration_ms": duration_ms,
+                "voice": voice,
+                "speed": speed,
+                "book_id": book_id,
+                "chunk_index": chunk_index,
+                "timings": timings_to_jsonable(timings),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    append_to_combined(
+        book_id,
+        wav_bytes,
+        sample_rate=sr,
+        chunk_duration_ms=duration_ms,
+        timings=timings,
+        chunk_index=chunk_index,
+    )
+
+    rel = f"/output/{book_id}/chunks/{chunk_index:06d}.wav"
+    return TTSResponse(
+        sample_rate=sr,
+        duration_ms=duration_ms,
+        timings=timings,
+        audio_url=rel,
+        audio_wav_base64=base64.b64encode(wav_bytes).decode("ascii"),
+        cache_key=key,
+    )
+
+
+@app.post("/api/book/convert", response_model=BookJobStatus)
+def book_convert(req: BookConvertRequest):
+    """Start continuous background conversion for an uploaded book.
+
+    The book source text is stored on upload as output/<book_id>/source.txt.
+    """
+    book_id = sanitize_book_id(require_book_id(req.book_id))
+    voice = req.voice or _KOKORO_DEFAULT_VOICE
+
+    # start (idempotent if already running)
+    st = book_job_manager.start(
+        book_id,
+        voice=voice,
+        speed=req.speed,
+        synthesize_chunk=lambda bid, idx, txt, v, s: _synthesize_and_store_book_chunk(
+            book_id=bid,
+            chunk_index=idx,
+            text=txt,
+            voice=v,
+            speed=s,
+        ),
+    )
+    return BookJobStatus(**st)
+
+
+@app.get("/api/book/status", response_model=BookJobStatus)
+def book_status(book_id: str):
+    """Get current conversion progress for a book."""
+    bid = sanitize_book_id(require_book_id(book_id))
+    st = book_job_manager.load_status(bid)
+    return BookJobStatus(**st)
+
+
+@app.post("/api/book/cancel", response_model=BookJobStatus)
+def book_cancel(book_id: str):
+    """Request cancellation of an in-progress conversion job."""
+    bid = sanitize_book_id(require_book_id(book_id))
+    book_job_manager.cancel(bid)
+    st = book_job_manager.load_status(bid)
+    return BookJobStatus(**st)
+
+
+@app.get("/api/book/meta", response_model=BookMeta)
+def book_meta(book_id: str):
+    """Get persisted metadata for a book useful for resume/seek.
+
+    Returns only the contiguous generated prefix's per-chunk durations.
+    """
+    bid = sanitize_book_id(require_book_id(book_id))
+    return BookMeta(**book_meta_payload(bid))
+
+
+@app.get("/api/book/combined", response_model=BookCombined)
+def book_combined(book_id: str):
+    """Return URLs for the combined streaming audiobook (book.wav) and its meta (book.json)."""
+    bid = sanitize_book_id(require_book_id(book_id))
+    wav_p = combined_wav_path(bid)
+    json_p = combined_json_path(bid)
+
+    has_audio = wav_p.exists()
+    has_meta = json_p.exists()
+
+    audio_url = f"/output/{bid}/book.wav" if has_audio else None
+    meta_url = f"/output/{bid}/book.json" if has_meta else None
+
+    return BookCombined(book_id=bid, audio_url=audio_url, meta_url=meta_url, has_audio=has_audio, has_meta=has_meta)
 
 
 @app.post("/api/tts", response_model=TTSResponse)
@@ -255,37 +421,27 @@ def tts(req: TTSRequest):
 
     # If book/chunk is provided, use book-scoped keying for deterministic storage
     if book_id is not None and chunk_index is not None:
-        key = f"{book_id}:{chunk_index}:{voice}:{req.speed}"
-    else:
-        key = tts_cache_key(req.text, voice=voice, speed=req.speed)
+        return _synthesize_and_store_book_chunk(
+            book_id=book_id,
+            chunk_index=chunk_index,
+            text=req.text,
+            voice=voice,
+            speed=req.speed,
+        )
 
-    # Cache hit: return timings + URL without re-synthesizing
-    if book_id is not None and chunk_index is not None:
-        ensure_book_dirs(book_id)
-        wav_p = chunk_wav_path(book_id, chunk_index)
-        json_p = chunk_json_path(book_id, chunk_index)
-        if wav_p.exists() and json_p.exists():
-            meta = json.loads(json_p.read_text(encoding="utf-8"))
-            timings = [WordTiming(**t) for t in meta.get("timings", [])]
-            rel = f"/output/{book_id}/chunks/{chunk_index:06d}.wav"
-            return TTSResponse(
-                sample_rate=int(meta.get("sample_rate", _KOKORO_SR)),
-                duration_ms=int(meta.get("duration_ms", 0)),
-                timings=timings,
-                audio_url=rel,
-                cache_key=key,
-            )
-    else:
-        if cache_exists(key):
-            meta = load_metadata(key)
-            timings = [WordTiming(**t) for t in meta.get("timings", [])]
-            return TTSResponse(
-                sample_rate=int(meta.get("sample_rate", _KOKORO_SR)),
-                duration_ms=int(meta.get("duration_ms", 0)),
-                timings=timings,
-                audio_url=f"/output/{key}.wav",
-                cache_key=key,
-            )
+    # Global cache by text
+    key = tts_cache_key(req.text, voice=voice, speed=req.speed)
+
+    if cache_exists(key):
+        meta = load_metadata(key)
+        timings = [WordTiming(**t) for t in meta.get("timings", [])]
+        return TTSResponse(
+            sample_rate=int(meta.get("sample_rate", _KOKORO_SR)),
+            duration_ms=int(meta.get("duration_ms", 0)),
+            timings=timings,
+            audio_url=f"/output/{key}.wav",
+            cache_key=key,
+        )
 
     audio, sr, timings = _kokoro_synthesize(req.text, voice, req.speed)
 
@@ -297,48 +453,6 @@ def tts(req: TTSRequest):
     buf = io.BytesIO()
     sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
     wav_bytes = buf.getvalue()
-
-    if book_id is not None and chunk_index is not None:
-        ensure_book_dirs(book_id)
-        wav_p = chunk_wav_path(book_id, chunk_index)
-        json_p = chunk_json_path(book_id, chunk_index)
-        wav_p.write_bytes(wav_bytes)
-        json_p.write_text(
-            json.dumps(
-                {
-                    "cache_key": key,
-                    "sample_rate": sr,
-                    "duration_ms": duration_ms,
-                    "voice": voice,
-                    "speed": req.speed,
-                    "book_id": book_id,
-                    "chunk_index": chunk_index,
-                    "timings": timings_to_jsonable(timings),
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-        # Append into combined book.wav/book.json if this is the next chunk
-        append_to_combined(
-            book_id,
-            wav_bytes,
-            sample_rate=sr,
-            chunk_duration_ms=duration_ms,
-            timings=timings,
-            chunk_index=chunk_index,
-        )
-
-        rel = f"/output/{book_id}/chunks/{chunk_index:06d}.wav"
-        return TTSResponse(
-            sample_rate=sr,
-            duration_ms=duration_ms,
-            timings=timings,
-            audio_url=rel,
-            audio_wav_base64=base64.b64encode(wav_bytes).decode("ascii"),
-            cache_key=key,
-        )
 
     # Save cache to disk (global cache)
     save_cache(

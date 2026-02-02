@@ -1,6 +1,25 @@
 export type UploadResponse = {
   filename: string;
   text: string;
+  book_id?: string | null;
+};
+
+export type BookConvertRequest = {
+  book_id: string;
+  voice?: string | null;
+  speed?: number;
+};
+
+export type BookJobStatus = {
+  book_id: string;
+  state: string; // idle|running|completed|failed|cancelled
+  voice?: string | null;
+  speed?: number | null;
+  total_chunks?: number | null;
+  next_chunk_index: number;
+  started_at_ms?: number | null;
+  updated_at_ms?: number | null;
+  last_error?: string | null;
 };
 
 export type WordTiming = {
@@ -62,6 +81,58 @@ export async function tts(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, voice, speed, ...opts }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function startBookConvert(req: BookConvertRequest): Promise<BookJobStatus> {
+  const res = await fetch(`${API_BASE}/api/book/convert`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getBookStatus(book_id: string): Promise<BookJobStatus> {
+  const res = await fetch(`${API_BASE}/api/book/status?book_id=${encodeURIComponent(book_id)}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export type BookMeta = {
+  book_id: string;
+  next_chunk_index: number;
+  total_duration_ms: number;
+  sample_rate?: number | null;
+  chunk_durations_ms: number[];
+};
+
+export async function getBookMeta(book_id: string): Promise<BookMeta> {
+  const res = await fetch(`${API_BASE}/api/book/meta?book_id=${encodeURIComponent(book_id)}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export type BookCombined = {
+  book_id: string;
+  audio_url?: string | null;
+  meta_url?: string | null;
+  has_audio: boolean;
+  has_meta: boolean;
+};
+
+export async function getBookCombined(book_id: string): Promise<BookCombined> {
+  const res = await fetch(`${API_BASE}/api/book/combined?book_id=${encodeURIComponent(book_id)}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function cancelBookConvert(book_id: string): Promise<BookJobStatus> {
+  const res = await fetch(`${API_BASE}/api/book/cancel?book_id=${encodeURIComponent(book_id)}`, {
+    method: "POST",
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
