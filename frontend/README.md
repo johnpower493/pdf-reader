@@ -18,19 +18,22 @@ Open `http://localhost:5173`.
 
 ## Backend configuration
 
-The API base URL is currently hard-coded in `src/api.ts`:
+The API base URL is configurable via Vite env var (recommended):
 
-- `API_BASE = "http://localhost:8000"`
+- `VITE_API_BASE=http://localhost:8000`
 
-If you run the backend elsewhere, update that constant (or refactor to use a Vite env var).
+and falls back to `http://localhost:8000` for local dev (see `src/api.ts`).
 
 ## What the UI does
 
 - Upload `.pdf`/`.txt` and display extracted text length.
 - Split text into ~1200 character chunks (`chunkText()` in `src/App.tsx`).
-- Generate audio per chunk via `POST /api/tts` using `book_id` (derived from filename) and `chunk_index`.
-- Play audio, highlight active word (binary search in `src/highlight.ts`), and allow click-to-seek by word.
-- Persist resume state (filename/text/voice/speed + playback position) in `localStorage` under key `kvtr_session_v1`.
+- Start background conversion for a book (recommended for large uploads) via `POST /api/book/convert`.
+- Play audio either:
+  - **Combined streaming mode**: stream `/output/<book_id>/book.wav` when available and use `/output/<book_id>/book.json` merged timings for highlighting + accurate seeking.
+  - **Fallback chunk mode**: generate per chunk via `POST /api/tts` using `book_id` and `chunk_index`.
+- Highlight active word (binary search in `src/highlight.ts`) and allow click-to-seek by word.
+- Persist multi-book resume state (filename/text/voice/speed + playback position) in `localStorage` under key `kvtr_session_library_v1` (see `src/persist.ts`).
 
 ## Scripts
 
