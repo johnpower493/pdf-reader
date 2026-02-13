@@ -1,4 +1,4 @@
-# Kokoro Visual Reader
+ # Kokoro Visual Reader
 
 A small **FastAPI + React** app for “visual TTS”: upload a book (`.pdf` or `.txt`), synthesize speech in **chunks**, and highlight words in the browser as audio plays.
 
